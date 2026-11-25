@@ -47,6 +47,17 @@ internal sealed class EntryDialog : Form
         };
         return box;
     }
+    public TextBox TextArea(string label, string value)
+    {
+        var box = Add(label, new TextBox { Text = value, Multiline = true, Height = 160, ScrollBars = ScrollBars.Vertical });
+        box.Validating += (_, e) =>
+        {
+            string message = string.IsNullOrWhiteSpace(box.Text) ? $"{label} is required." : "";
+            errors.SetError(box, message);
+            e.Cancel = message.Length > 0;
+        };
+        return box;
+    }
     public ComboBox Select(string label, IEnumerable<Choice> choices, int? selected = null)
     {
         var box = Add(label, new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList });

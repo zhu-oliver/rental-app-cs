@@ -15,7 +15,7 @@ internal sealed class BillDialog : Form
         AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, RowHeadersVisible = false
     };
 
-    public BillDialog(RentalService service)
+    public BillDialog(RentalService service, int? propertyId = null)
     {
         this.service = service;
         Text = "Create property bill"; Width = 720; Height = 530; StartPosition = FormStartPosition.CenterParent;
@@ -40,7 +40,8 @@ internal sealed class BillDialog : Form
         Controls.Add(allocations); Controls.Add(hint); Controls.Add(top); Controls.Add(bar);
         property.SelectedIndexChanged += (_, _) => Populate();
         due.ValueChanged += (_, _) => Populate();
-        if (property.Items.Count > 0) property.SelectedIndex = 0;
+        if (propertyId is not null) property.SelectedItem = property.Items.Cast<Choice>().FirstOrDefault(p => p.Id == propertyId);
+        else if (property.Items.Count > 0) property.SelectedIndex = 0;
         CancelButton = cancel;
     }
 

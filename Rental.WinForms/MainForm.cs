@@ -1,10 +1,9 @@
-using System.Drawing.Imaging;
 using System.Text;
 using Rental.Business;
 
 namespace Rental.WinForms;
 
-internal sealed class MainForm : Form
+internal sealed partial class MainForm : Form
 {
     private readonly RentalService service;
     private readonly SendGridSender sender;
@@ -22,16 +21,19 @@ internal sealed class MainForm : Form
         sender = new SendGridSender(directory);
         Text = "Rental Property Manager"; Width = 1200; Height = 760; StartPosition = FormStartPosition.CenterScreen;
         Controls.Add(tabs);
-        AddPage("Properties", ("Add", () => EditProperty(null)), ("Edit", () => EditProperty(SelectedProperty())));
+        AddHomePage();
+        AddPage("Properties", ("Add", () => EditProperty(null)), ("View profile", () => ShowPropertyProfile(SelectedProperty().Id)), ("Edit", () => EditProperty(SelectedProperty())));
         AddPage("Units", ("Add", () => EditUnit(null)), ("Edit", () => EditUnit(SelectedUnit())));
-        AddPage("Renters", ("Add", () => EditRenter(null)), ("Edit", () => EditRenter(SelectedRenter())));
+        AddPage("Renters", ("Add", () => EditRenter(null)), ("View profile", () => ShowRenterProfile(SelectedRenter().Id)), ("Edit", () => EditRenter(SelectedRenter())));
         AddPage("Assignments", ("Add", () => EditLease(null)), ("Edit", () => EditLease(SelectedLease())));
-        AddPage("Charges", ("Generate monthly rent", GenerateRent), ("Create split bill", CreateBill),
-            ("Mark paid", MarkPaid), ("Mark unpaid", MarkUnpaid), ("Send bill notice", () => Send("Bill")),
+        AddPage("Charges", ("Generate monthly rent", GenerateRent), ("Create split bill", () => CreateBill()),
+            ("Record payment", () => MarkPaid()), ("Clear payments", () => MarkUnpaid()), ("Send bill notice", () => Send("Bill")),
             ("Send late notice", () => Send("Late")), ("Send receipt", () => Send("Receipt")), ("Email settings", ConfigureEmail));
         AddPage("Expenses", ("Add", () => EditExpense(null)), ("Edit", () => EditExpense(SelectedExpense())),
-            ("Import receipt", ImportReceipt), ("View / export receipts", ViewReceipts));
+            ("Import receipt", () => ImportReceipt()), ("View / export receipts", () => ViewReceipts()));
         AddReportPage();
+        grids["Properties"].CellDoubleClick += (_, e) => { if (e.RowIndex >= 0) Run(() => ShowPropertyProfile(SelectedProperty().Id)); };
+        grids["Renters"].CellDoubleClick += (_, e) => { if (e.RowIndex >= 0) Run(() => ShowRenterProfile(SelectedRenter().Id)); };
         RefreshAll();
     }
 
@@ -115,18 +117,19 @@ internal sealed class MainForm : Form
         var units = service.Store.Units();
         var renters = service.Store.Renters();
         var leases = service.Store.Leases();
+        var paidByCharge = service.Store.Payments().GroupBy(x => x.ChargeId).ToDictionary(g => g.Key, g => g.Sum(x => x.AmountCents));
         var p = properties.ToDictionary(x => x.Id);
         var u = units.ToDictionary(x => x.Id);
         var r = renters.ToDictionary(x => x.Id);
         var l = leases.ToDictionary(x => x.Id);
-        grids["Properties"].DataSource = properties.ToList();
+        grids["Properties"].DataSource = properties.Select(x => new { x.Id, x.Name, Address = FormatAddress(x), PurchasePrice = x.PurchasePriceCents is null ? "" : Money(x.PurchasePriceCents.Value) }).ToList();
         grids["Units"].DataSource = units.Select(x => new { x.Id, Property = p[x.PropertyId].Name, Unit = x.Name }).ToList();
-        grids["Renters"].DataSource = renters.ToList();
+        grids["Renters"].DataSource = renters.Select(x => new { x.Id, x.Name, x.Email, x.Phone, SecondaryContact = x.SecondaryContactName }).ToList();
         grids["Assignments"].DataSource = leases.Select(x => new { x.Id, Property = p[u[x.UnitId].PropertyId].Name, Unit = u[x.UnitId].Name,
             Renter = r[x.RenterId].Name, Start = x.Start.ToString("d"), End = x.End?.ToString("d") ?? "", Rent = Money(x.MonthlyRentCents), Deposit = Money(x.DepositCents) }).ToList();
         grids["Charges"].DataSource = service.Store.Charges().Select(x => new { x.Id, Property = p[x.PropertyId].Name, Renter = r[l[x.LeaseId].RenterId].Name,
             x.Kind, x.Description, Due = x.DueDate.ToString("d"), Amount = Money(x.AmountCents), Status = x.PaidDate is not null ? "Paid" : x.DueDate < DateOnly.FromDateTime(DateTime.Today) ? "Overdue" : "Unpaid",
-            Paid = x.PaidDate?.ToString("d") ?? "", Allocation = x.Percentage is null ? "" : $"{x.Percentage}%" }).ToList();
+            Balance = Money(x.AmountCents - paidByCharge.GetValueOrDefault(x.Id)), Paid = x.PaidDate?.ToString("d") ?? "", Allocation = x.Percentage is null ? "" : $"{x.Percentage}%" }).ToList();
         grids["Expenses"].DataSource = service.Store.Expenses().Select(x => new { x.Id, Property = p[x.PropertyId].Name, x.Category, x.Description,
             Paid = x.PaidDate.ToString("d"), Amount = Money(x.AmountCents) }).ToList();
         int selected = (reportProperty.SelectedItem as Choice)?.Id ?? 0;
@@ -134,33 +137,53 @@ internal sealed class MainForm : Form
         reportProperty.Items.AddRange(PropertyChoices().Cast<object>().ToArray());
         reportProperty.SelectedItem = reportProperty.Items.Cast<Choice>().FirstOrDefault(c => c.Id == selected) ?? reportProperty.Items[0];
         currentReport = null; grids["Reports"].DataSource = null; reportSummary.Text = "Run a report to see totals.";
+        RefreshHome();
     }
 
     private void EditProperty(Property? value)
     {
-        TextBox name = null!, address = null!;
+        TextBox name = null!, address = null!, line2 = null!, city = null!, region = null!, postal = null!, country = null!, price = null!;
         using var dialog = new EntryDialog(value is null ? "Add property" : "Edit property", () =>
-        { service.Save(new Property(value?.Id ?? 0, name.Text, address.Text)); return true; });
-        name = dialog.TextField("Name", value?.Name ?? ""); address = dialog.TextField("Address", value?.Address ?? "");
-        if (dialog.ShowDialog(this) == DialogResult.OK) RefreshAll();
+        {
+            long? cents = null;
+            if (!string.IsNullOrWhiteSpace(price.Text))
+            {
+                if (!decimal.TryParse(price.Text, out var number)) throw new ArgumentException("Enter a valid purchase price or leave it blank.");
+                cents = RentalService.Cents(number);
+            }
+            service.Save(new Property(value?.Id ?? 0, name.Text, address.Text, line2.Text, city.Text, region.Text, postal.Text, country.Text, cents)); return true;
+        });
+        name = dialog.TextField("Name", value?.Name ?? ""); address = dialog.TextField("Street address", value?.Address ?? "");
+        line2 = dialog.TextField("Address line 2", value?.AddressLine2 ?? "", required: false);
+        city = dialog.TextField("City", value?.City ?? "", required: false);
+        region = dialog.TextField("State / province", value?.Region ?? "", required: false);
+        postal = dialog.TextField("Postal code", value?.PostalCode ?? "", required: false);
+        country = dialog.TextField("Country", value?.Country ?? "", required: false);
+        price = dialog.TextField("Purchase price (optional)", value?.PurchasePriceCents is null ? "" : (value.PurchasePriceCents.Value / 100m).ToString("F2"), required: false);
+        if (dialog.ShowDialog(Form.ActiveForm ?? this) == DialogResult.OK) RefreshAll();
     }
-    private void EditUnit(Unit? value)
+    private void EditUnit(Unit? value, int? propertyId = null)
     {
         ComboBox property = null!; TextBox name = null!;
         using var dialog = new EntryDialog(value is null ? "Add unit" : "Edit unit", () =>
         { service.Save(new Unit(value?.Id ?? 0, EntryDialog.Selected(property), name.Text)); return true; });
-        property = dialog.Select("Property", PropertyChoices(), value?.PropertyId); name = dialog.TextField("Unit name", value?.Name ?? "");
-        if (dialog.ShowDialog(this) == DialogResult.OK) RefreshAll();
+        property = dialog.Select("Property", PropertyChoices(), value?.PropertyId ?? propertyId); name = dialog.TextField("Unit name", value?.Name ?? "");
+        if (dialog.ShowDialog(Form.ActiveForm ?? this) == DialogResult.OK) RefreshAll();
     }
     private void EditRenter(Renter? value)
     {
-        TextBox name = null!, email = null!;
+        TextBox name = null!, email = null!, phone = null!, secondaryName = null!, secondaryPhone = null!, secondaryEmail = null!, relationship = null!;
         using var dialog = new EntryDialog(value is null ? "Add renter" : "Edit renter", () =>
-        { service.Save(new Renter(value?.Id ?? 0, name.Text, email.Text)); return true; });
+        { service.Save(new Renter(value?.Id ?? 0, name.Text, email.Text, phone.Text, secondaryName.Text, secondaryPhone.Text, secondaryEmail.Text, relationship.Text)); return true; });
         name = dialog.TextField("Name", value?.Name ?? ""); email = dialog.TextField("Email", value?.Email ?? "", email: true);
-        if (dialog.ShowDialog(this) == DialogResult.OK) RefreshAll();
+        phone = dialog.TextField("Phone", value?.Phone ?? "", required: false);
+        secondaryName = dialog.TextField("Secondary contact name", value?.SecondaryContactName ?? "", required: false);
+        secondaryPhone = dialog.TextField("Secondary contact phone", value?.SecondaryContactPhone ?? "", required: false);
+        secondaryEmail = dialog.TextField("Secondary contact email", value?.SecondaryContactEmail ?? "", required: false);
+        relationship = dialog.TextField("Contact relationship", value?.SecondaryContactRelationship ?? "", required: false);
+        if (dialog.ShowDialog(Form.ActiveForm ?? this) == DialogResult.OK) RefreshAll();
     }
-    private void EditLease(Lease? value)
+    private void EditLease(Lease? value, int? renterId = null)
     {
         ComboBox unit = null!, renter = null!; DateTimePicker start = null!, end = null!; NumericUpDown rent = null!, deposit = null!;
         using var dialog = new EntryDialog(value is null ? "Add assignment" : "Edit assignment", () =>
@@ -168,10 +191,10 @@ internal sealed class MainForm : Form
             service.Save(new Lease(value?.Id ?? 0, EntryDialog.Selected(unit), EntryDialog.Selected(renter), EntryDialog.DateValue(start),
                 EntryDialog.OptionalDate(end), RentalService.Cents(rent.Value), RentalService.Cents(deposit.Value))); return true;
         });
-        unit = dialog.Select("Unit", UnitChoices(), value?.UnitId); renter = dialog.Select("Renter", RenterChoices(), value?.RenterId);
+        unit = dialog.Select("Unit", UnitChoices(), value?.UnitId); renter = dialog.Select("Renter", RenterChoices(), value?.RenterId ?? renterId);
         start = dialog.Date("Start", value?.Start); end = dialog.Date("End (optional)", value?.End, true);
         rent = dialog.Money("Monthly rent", value?.MonthlyRentCents ?? 0); deposit = dialog.Money("Deposit", value?.DepositCents ?? 0);
-        if (dialog.ShowDialog(this) == DialogResult.OK) RefreshAll();
+        if (dialog.ShowDialog(Form.ActiveForm ?? this) == DialogResult.OK) RefreshAll();
     }
     private void GenerateRent()
     {
@@ -182,30 +205,37 @@ internal sealed class MainForm : Form
             MessageBox.Show(this, $"Created {count} rent charge(s).", "Rent"); return true;
         });
         month = dialog.Date("Month (any date)"); due = dialog.Date("Due date");
-        if (dialog.ShowDialog(this) == DialogResult.OK) RefreshAll();
+        if (dialog.ShowDialog(Form.ActiveForm ?? this) == DialogResult.OK) RefreshAll();
     }
-    private void CreateBill()
+    private void CreateBill(int? propertyId = null)
     {
-        using var dialog = new BillDialog(service);
-        if (dialog.ShowDialog(this) == DialogResult.OK) RefreshAll();
+        using var dialog = new BillDialog(service, propertyId);
+        if (dialog.ShowDialog(Form.ActiveForm ?? this) == DialogResult.OK) RefreshAll();
     }
-    private void MarkPaid()
+    private void MarkPaid(Charge? selected = null)
     {
-        var charge = SelectedCharge();
+        var charge = selected ?? SelectedCharge();
         if (charge.PaidDate is not null) throw new InvalidOperationException("This charge is already paid. Mark it unpaid first to correct its payment date.");
-        DateTimePicker date = null!;
-        using var dialog = new EntryDialog("Record payment", () => { service.SetPayment(charge.Id, EntryDialog.DateValue(date)); return true; });
+        DateTimePicker date = null!; NumericUpDown amount = null!;
+        long balance = service.Balance(charge);
+        using var dialog = new EntryDialog("Record payment", () =>
+        {
+            if (balance == 0) service.SetPayment(charge.Id, EntryDialog.DateValue(date));
+            else service.RecordPayment(charge.Id, EntryDialog.DateValue(date), RentalService.Cents(amount.Value));
+            return true;
+        });
         date = dialog.Date("Payment date");
-        if (dialog.ShowDialog(this) == DialogResult.OK) RefreshAll();
+        amount = dialog.Money("Amount received", balance);
+        if (dialog.ShowDialog(Form.ActiveForm ?? this) == DialogResult.OK) RefreshAll();
     }
-    private void MarkUnpaid()
+    private void MarkUnpaid(Charge? selected = null)
     {
-        var charge = SelectedCharge();
-        if (charge.PaidDate is null) throw new InvalidOperationException("This charge is already unpaid.");
-        if (MessageBox.Show(this, "Remove the recorded payment date?", "Mark unpaid", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        var charge = selected ?? SelectedCharge();
+        if (charge.PaidDate is null && !service.Store.Payments().Any(p => p.ChargeId == charge.Id)) throw new InvalidOperationException("This charge has no recorded payments.");
+        if (MessageBox.Show(Form.ActiveForm ?? this, "Remove ALL recorded payments for this charge? This cannot be undone.", "Clear payments", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
         service.SetPayment(charge.Id, null); RefreshAll();
     }
-    private void EditExpense(Expense? value)
+    private void EditExpense(Expense? value, int? propertyId = null)
     {
         ComboBox property = null!; TextBox category = null!, description = null!; DateTimePicker date = null!; NumericUpDown amount = null!;
         using var dialog = new EntryDialog(value is null ? "Add expense" : "Edit expense", () =>
@@ -213,36 +243,30 @@ internal sealed class MainForm : Form
             service.Save(new Expense(value?.Id ?? 0, EntryDialog.Selected(property), category.Text, description.Text,
                 EntryDialog.DateValue(date), RentalService.Cents(amount.Value))); return true;
         });
-        property = dialog.Select("Property", PropertyChoices(), value?.PropertyId); category = dialog.TextField("Category (e.g. Maintenance, Property taxes)", value?.Category ?? "");
+        property = dialog.Select("Property", PropertyChoices(), value?.PropertyId ?? propertyId); category = dialog.TextField("Category (e.g. Maintenance, Property taxes)", value?.Category ?? "");
         description = dialog.TextField("Description", value?.Description ?? ""); date = dialog.Date("Date paid", value?.PaidDate); amount = dialog.Money("Amount", value?.AmountCents ?? 0);
-        if (dialog.ShowDialog(this) == DialogResult.OK) RefreshAll();
+        if (dialog.ShowDialog(Form.ActiveForm ?? this) == DialogResult.OK) RefreshAll();
     }
-    private void ImportReceipt()
+    private void ImportReceipt(Expense? selected = null)
     {
-        var expense = SelectedExpense();
+        var expense = selected ?? SelectedExpense();
         using var open = new OpenFileDialog { Filter = "Image files|*.jpg;*.jpeg;*.png;*.gif;*.bmp", Multiselect = true };
-        if (open.ShowDialog(this) != DialogResult.OK) return;
+        if (open.ShowDialog(Form.ActiveForm ?? this) != DialogResult.OK) return;
         var images = new List<(string Name, string Type, byte[] Data)>();
         foreach (string file in open.FileNames)
         {
-            if (new FileInfo(file).Length > 20 * 1024 * 1024) throw new ArgumentException($"Receipt image {Path.GetFileName(file)} exceeds the 20 MB limit.");
-            byte[] data = File.ReadAllBytes(file);
-            using var stream = new MemoryStream(data);
-            using var image = Image.FromStream(stream, true, true);
-            string type = image.RawFormat.Equals(ImageFormat.Jpeg) ? "image/jpeg" : image.RawFormat.Equals(ImageFormat.Png) ? "image/png" :
-                image.RawFormat.Equals(ImageFormat.Gif) ? "image/gif" : image.RawFormat.Equals(ImageFormat.Bmp) ? "image/bmp" :
-                throw new ArgumentException("Only JPEG, PNG, GIF, and BMP images are supported.");
-            images.Add((Path.GetFileName(file), type, data));
+            var image = ReadImage(file);
+            images.Add((image.FileName, image.ContentType, image.Data));
         }
         foreach (var image in images) service.AddReceipt(expense.Id, image.Name, image.Type, image.Data);
         MessageBox.Show(this, "Receipt images imported.", "Receipts");
     }
-    private void ViewReceipts()
+    private void ViewReceipts(Expense? selected = null)
     {
-        var receipts = service.Store.Receipts(SelectedExpense().Id);
+        var receipts = service.Store.Receipts((selected ?? SelectedExpense()).Id);
         if (receipts.Count == 0) { MessageBox.Show(this, "No receipt images for this expense."); return; }
         using var dialog = new ReceiptDialog(receipts);
-        dialog.ShowDialog(this);
+        dialog.ShowDialog(Form.ActiveForm ?? this);
     }
     private void ConfigureEmail()
     {
@@ -252,25 +276,42 @@ internal sealed class MainForm : Form
         key = dialog.TextField(sender.Configured ? "API key (blank keeps existing)" : "API key", secret: true, required: !sender.Configured);
         dialog.ShowDialog(this);
     }
-    private async void Send(string type)
+    private async void Send(string type, Charge? selected = null)
     {
         if (sending) return;
         try
         {
-            var charge = SelectedCharge();
-            if (MessageBox.Show(this, $"Send {type.ToLowerInvariant()} email for the selected charge?", "Confirm email", MessageBoxButtons.YesNo) != DialogResult.Yes) return;
+            var charge = selected ?? SelectedCharge();
+            var draft = service.PrepareNotice(charge.Id, type, DateOnly.FromDateTime(DateTime.Today));
+            TextBox subject = null!, message = null!;
+            using (var preview = new EntryDialog("Preview and edit email", () => true))
+            {
+                var recipient = preview.TextField("To", draft.Recipient); recipient.ReadOnly = true;
+                subject = preview.TextField("Subject", draft.Subject);
+                message = preview.TextArea("Message", draft.Message);
+                if (preview.ShowDialog(Form.ActiveForm ?? this) != DialogResult.OK) return;
+                draft = draft with { Subject = subject.Text, Message = message.Text };
+            }
+            if (MessageBox.Show(Form.ActiveForm ?? this, $"Send {type.ToLowerInvariant()} email for the selected charge?", "Confirm email", MessageBoxButtons.YesNo) != DialogResult.Yes) return;
             sending = true;
-            await service.SendNoticeAsync(charge.Id, type, sender, DateOnly.FromDateTime(DateTime.Today));
-            MessageBox.Show(this, "SendGrid accepted the message. Delivery is not guaranteed.", "Email sent");
+            await service.SendPreparedAsync(draft, sender, DateOnly.FromDateTime(DateTime.Today));
+            MessageBox.Show(Form.ActiveForm ?? this, "SendGrid accepted the message. Delivery is not guaranteed.", "Email sent");
         }
-        catch (Exception ex) { MessageBox.Show(this, ex.Message, "Email failed", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+        catch (Exception ex) { MessageBox.Show(Form.ActiveForm ?? this, ex.Message + "\n\nIf a send was attempted, check its status before retrying.", "Email not confirmed", MessageBoxButtons.OK, MessageBoxIcon.Error); }
         finally { sending = false; }
     }
     private void RunReport()
     {
         int id = EntryDialog.Selected(reportProperty);
         currentReport = service.GetReport(id == 0 ? null : id, EntryDialog.DateValue(reportFrom), EntryDialog.DateValue(reportTo));
-        grids["Reports"].DataSource = currentReport.Rows.Select(x => new { x.Property, x.Type, x.Description, Date = x.Date.ToString("d"), Amount = Money(x.AmountCents) }).ToList();
+        var summaries = RentalService.PropertySummaries(currentReport).SelectMany(p => new[]
+        {
+            new { Property = $"{p.Property} (#{p.PropertyId})", Type = "Property summary", Description = "Rent received", Date = "", Amount = Money(p.RentCents) },
+            new { Property = $"{p.Property} (#{p.PropertyId})", Type = "Property summary", Description = "Bill reimbursements", Date = "", Amount = Money(p.ReimbursementsCents) },
+            new { Property = $"{p.Property} (#{p.PropertyId})", Type = "Property summary", Description = "Expenses", Date = "", Amount = Money(p.ExpenseCents) },
+            new { Property = $"{p.Property} (#{p.PropertyId})", Type = "Property summary", Description = "Rent less expenses", Date = "", Amount = Money(p.RentCents - p.ExpenseCents) }
+        });
+        grids["Reports"].DataSource = summaries.Concat(currentReport.Rows.Select(x => new { x.Property, x.Type, x.Description, Date = x.Date.ToString("d"), Amount = Money(x.AmountCents) })).ToList();
         string categories = string.Join("; ", currentReport.ExpensesByCategory.Select(x => $"{x.Key}: {Money(x.Value)}"));
         reportSummary.Text = $"Rent received: {Money(currentReport.RentCents)}   Bill reimbursements: {Money(currentReport.ReimbursementsCents)}   Expenses: {Money(currentReport.ExpenseCents)}   Rent less expenses: {Money(currentReport.NetCents)} (not a tax calculation)\n{categories}";
     }

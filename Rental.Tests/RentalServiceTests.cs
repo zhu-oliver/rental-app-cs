@@ -92,6 +92,10 @@ public sealed class RentalServiceTests : IDisposable
         Assert.Contains("\"'=repair, fixture\"", RentalService.ReportCsv(report));
         Assert.Contains("\"Summary\",\"Rent received\",,1234.56", RentalService.ReportCsv(report));
         Assert.Equal(3, report.Rows.Count);
+        var summary = RentalService.PropertySummaries(report).Single();
+        Assert.Equal(property, summary.PropertyId);
+        Assert.Equal(123456, summary.RentCents);
+        Assert.Equal(10000, summary.ExpenseCents);
         service.SetPayment(store.Charges().Single(c => c.Kind == "Rent").Id, null);
         Assert.Equal(0, service.GetReport(property, June, June.AddDays(29)).RentCents);
         Assert.Throws<ArgumentException>(() => service.GetReport(property, June.AddDays(1), June));
@@ -125,6 +129,10 @@ public sealed class RentalServiceTests : IDisposable
         Assert.Contains("received", sender.Body);
         sender.Fail = true;
         await Assert.ThrowsAsync<InvalidOperationException>(() => service.SendNoticeAsync(charge.Id, "Receipt", sender, June.AddDays(2)));
+        var history = new SqliteRentalStore(path).EmailAttempts();
+        Assert.Equal("Not confirmed", history[0].Status);
+        Assert.Equal("Accepted", history[1].Status);
+        Assert.Equal("Accepted", history[2].Status);
     }
 
     [Fact]
@@ -147,6 +155,46 @@ public sealed class RentalServiceTests : IDisposable
         var ids = store.Leases().Select(l => l.Id).Order().ToArray();
         service.CreateBill(store.Properties().Single().Id, "Water", June, 1, [new(ids[1], 50), new(ids[0], 50)]);
         Assert.Equal(new long[] { 1, 0 }, store.Charges().OrderBy(c => c.LeaseId).Select(c => c.AmountCents));
+    }
+
+    [Fact]
+    public async Task Partial_payments_affect_balance_reports_and_receipts_on_payment_dates()
+    {
+        service.GenerateRent(June, June);
+        var charge = store.Charges().Single();
+        service.RecordPayment(charge.Id, June.AddDays(1), 10000);
+        Assert.Equal(113456, service.Balance(charge));
+        Assert.Null(store.Charges().Single().PaidDate);
+        Assert.Equal(10000, service.GetReport(null, June, June.AddDays(1)).RentCents);
+        Assert.Throws<ArgumentException>(() => service.RecordPayment(charge.Id, June.AddDays(2), 113457));
+        var sender = new FakeSender();
+        await service.SendNoticeAsync(charge.Id, "Receipt", sender, June.AddDays(1));
+        Assert.Contains("100", sender.Body);
+        service.RecordPayment(charge.Id, June.AddMonths(1), 113456);
+        Assert.Equal(June.AddMonths(1), store.Charges().Single().PaidDate);
+        Assert.Equal(10000, service.GetReport(null, June, June.AddDays(29)).RentCents);
+        Assert.Equal(113456, service.GetReport(null, June.AddMonths(1), June.AddMonths(1)).RentCents);
+        Assert.Equal(2, new SqliteRentalStore(path).Payments().Count);
+    }
+
+    [Fact]
+    public void Maintenance_and_documents_persist_and_keep_property_relationships()
+    {
+        int property = store.Properties().Single().Id;
+        int unit = store.Units().Single().Id;
+        int expense = service.Save(new Expense(0, property, "Maintenance", "Plumber", June, 5000));
+        service.Save(new Maintenance(0, property, unit, "Leak", "In progress", "Plumber", expense));
+        service.AddDocument(property, null, "invoice.pdf", [1, 2]);
+        service.AddDocument(null, store.Renters().Single().Id, "lease.pdf", [3, 4]);
+        var reopened = new SqliteRentalStore(path);
+        Assert.Equal(expense, reopened.MaintenanceItems(property).Single().ExpenseId);
+        Assert.Equal(new byte[] { 1, 2 }, reopened.Documents(property, null).Single().Data);
+        Assert.Equal("lease.pdf", reopened.Documents(null, store.Renters().Single().Id).Single().FileName);
+        service.Save(new Property(0, "Other", "456 Main"));
+        int other = store.Properties().Single(p => p.Name == "Other").Id;
+        Assert.Throws<ArgumentException>(() => service.Save(store.Expenses().Single() with { PropertyId = other }));
+        Assert.Throws<ArgumentException>(() => service.Save(new Maintenance(0, other, unit, "Leak", "Open", "", null)));
+        Assert.Throws<ArgumentException>(() => service.AddDocument(property, store.Renters().Single().Id, "bad", [1]));
     }
 
     private sealed class FakeSender : IEmailSender

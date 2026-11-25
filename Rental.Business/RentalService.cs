@@ -27,16 +27,22 @@ public sealed class RentalService(IRentalStore store)
     public void Save(Property p)
     {
         Required(p.Name, "Property name"); Required(p.Address, "Address");
-        Store.SaveProperty(p with { Name = p.Name.Trim(), Address = p.Address.Trim() });
+        if (p.PurchasePriceCents < 0) throw new ArgumentException("Purchase price cannot be negative.");
+        Store.SaveProperty(p with { Name = p.Name.Trim(), Address = p.Address.Trim(), AddressLine2 = p.AddressLine2.Trim(),
+            City = p.City.Trim(), Region = p.Region.Trim(), PostalCode = p.PostalCode.Trim(), Country = p.Country.Trim() });
     }
 
     public void Save(Unit u)
     {
         Required(u.Name, "Unit name");
         Exists(Store.Properties().Any(p => p.Id == u.PropertyId), "Property");
-        if (u.Id != 0 && Store.Units().Single(x => x.Id == u.Id).PropertyId != u.PropertyId &&
-            Store.Leases().Any(l => l.UnitId == u.Id))
-            throw new ArgumentException("A unit with assignments cannot be moved to another property.");
+        if (u.Id != 0)
+        {
+            var old = Store.Units().Single(x => x.Id == u.Id);
+            if (old.PropertyId != u.PropertyId && (Store.Leases().Any(l => l.UnitId == u.Id) ||
+                Store.MaintenanceItems(old.PropertyId).Any(m => m.UnitId == u.Id)))
+                throw new ArgumentException("A unit with assignments or maintenance cannot be moved to another property.");
+        }
         Store.SaveUnit(u with { Name = u.Name.Trim() });
     }
 
@@ -44,7 +50,43 @@ public sealed class RentalService(IRentalStore store)
     {
         Required(r.Name, "Renter name"); Required(r.Email, "Email");
         if (!MailAddress.TryCreate(r.Email.Trim(), out _)) throw new ArgumentException("Enter a valid email address.");
-        Store.SaveRenter(r with { Name = r.Name.Trim(), Email = r.Email.Trim() });
+        if (!string.IsNullOrWhiteSpace(r.SecondaryContactEmail) && !MailAddress.TryCreate(r.SecondaryContactEmail.Trim(), out _))
+            throw new ArgumentException("Enter a valid secondary contact email address.");
+        Store.SaveRenter(r with { Name = r.Name.Trim(), Email = r.Email.Trim(), Phone = r.Phone.Trim(),
+            SecondaryContactName = r.SecondaryContactName.Trim(), SecondaryContactPhone = r.SecondaryContactPhone.Trim(),
+            SecondaryContactEmail = r.SecondaryContactEmail.Trim(), SecondaryContactRelationship = r.SecondaryContactRelationship.Trim() });
+    }
+
+    public void SetPhoto(int propertyId, PropertyPhoto? photo)
+    {
+        Exists(Store.Properties().Any(p => p.Id == propertyId), "Property");
+        if (photo is not null && (string.IsNullOrWhiteSpace(photo.FileName) ||
+            !new[] { "image/jpeg", "image/png", "image/gif", "image/bmp" }.Contains(photo.ContentType) ||
+            photo.Data.Length == 0 || photo.Data.Length > 20 * 1024 * 1024))
+            throw new ArgumentException("Photo must be a JPEG, PNG, GIF, or BMP image no larger than 20 MB.");
+        Store.SetPhoto(propertyId, photo);
+    }
+
+    public void Save(Maintenance item)
+    {
+        Exists(Store.Properties().Any(p => p.Id == item.PropertyId), "Property");
+        Required(item.Description, "Description");
+        if (item.Status is not ("Open" or "In progress" or "Completed")) throw new ArgumentException("Select a valid maintenance status.");
+        if (item.UnitId is not null && !Store.Units().Any(u => u.Id == item.UnitId && u.PropertyId == item.PropertyId))
+            throw new ArgumentException("The selected unit must belong to this property.");
+        if (item.ExpenseId is not null && !Store.Expenses().Any(e => e.Id == item.ExpenseId && e.PropertyId == item.PropertyId))
+            throw new ArgumentException("The selected expense must belong to this property.");
+        Store.SaveMaintenance(item with { Description = item.Description.Trim(), Contractor = item.Contractor.Trim() });
+    }
+
+    public void AddDocument(int? propertyId, int? renterId, string fileName, byte[] data)
+    {
+        if ((propertyId is null) == (renterId is null)) throw new ArgumentException("Choose one property or renter.");
+        if (propertyId is not null) Exists(Store.Properties().Any(p => p.Id == propertyId), "Property");
+        if (renterId is not null) Exists(Store.Renters().Any(r => r.Id == renterId), "Renter");
+        Required(fileName, "Filename");
+        if (data.Length == 0 || data.Length > 20 * 1024 * 1024) throw new ArgumentException("Document must be non-empty and no larger than 20 MB.");
+        Store.AddDocument(new Document(0, propertyId, renterId, Path.GetFileName(fileName), data));
     }
 
     public void Save(Lease l)
@@ -113,11 +155,27 @@ public sealed class RentalService(IRentalStore store)
         Store.SetPaidDate(chargeId, date);
     }
 
+    public long Balance(Charge charge) => charge.AmountCents - Store.Payments().Where(p => p.ChargeId == charge.Id).Sum(p => p.AmountCents);
+
+    public void RecordPayment(int chargeId, DateOnly date, long amountCents)
+    {
+        var charge = Store.Charges().SingleOrDefault(c => c.Id == chargeId) ?? throw new ArgumentException("Charge not found.");
+        if (charge.PaidDate is not null || amountCents <= 0 || amountCents > Balance(charge))
+            throw new ArgumentException("Payment must be positive and no greater than the outstanding balance.");
+        Store.AddPayment(chargeId, date, amountCents);
+    }
+
     public int Save(Expense expense)
     {
         Exists(Store.Properties().Any(p => p.Id == expense.PropertyId), "Property");
         Required(expense.Category, "Category"); Required(expense.Description, "Description");
         if (expense.AmountCents <= 0) throw new ArgumentException("Expense amount must be greater than zero.");
+        if (expense.Id != 0)
+        {
+            var old = Store.Expenses().Single(e => e.Id == expense.Id);
+            if (old.PropertyId != expense.PropertyId && Store.MaintenanceItems(old.PropertyId).Any(m => m.ExpenseId == expense.Id))
+                throw new ArgumentException("An expense linked to maintenance cannot be moved to another property.");
+        }
         return Store.SaveExpense(expense with { Category = expense.Category.Trim(), Description = expense.Description.Trim() });
     }
 
@@ -135,15 +193,23 @@ public sealed class RentalService(IRentalStore store)
         if (from > to) throw new ArgumentException("Start date must not be after end date.");
         if (propertyId is not null) Exists(Store.Properties().Any(p => p.Id == propertyId), "Property");
         var properties = Store.Properties().ToDictionary(p => p.Id);
-        var charges = Store.Charges().Where(c => c.PaidDate >= from && c.PaidDate <= to && (propertyId is null || c.PropertyId == propertyId)).ToList();
+        var charges = Store.Charges().Where(c => propertyId is null || c.PropertyId == propertyId).ToDictionary(c => c.Id);
+        var payments = Store.Payments().Where(p => p.Date >= from && p.Date <= to && charges.ContainsKey(p.ChargeId)).ToList();
         var expenses = Store.Expenses().Where(e => e.PaidDate >= from && e.PaidDate <= to && (propertyId is null || e.PropertyId == propertyId)).ToList();
-        var rows = charges.Select(c => new ReportRow(properties[c.PropertyId].Name, c.Kind == "Rent" ? "Rent received" : "Bill reimbursement", c.Description, c.PaidDate!.Value, c.AmountCents))
-            .Concat(expenses.Select(e => new ReportRow(properties[e.PropertyId].Name, $"Expense: {e.Category}", e.Description, e.PaidDate, -e.AmountCents)))
+        var rows = payments.Select(p => new ReportRow(properties[charges[p.ChargeId].PropertyId].Name, charges[p.ChargeId].Kind == "Rent" ? "Rent received" : "Bill reimbursement", charges[p.ChargeId].Description, p.Date, p.AmountCents, charges[p.ChargeId].PropertyId))
+            .Concat(expenses.Select(e => new ReportRow(properties[e.PropertyId].Name, $"Expense: {e.Category}", e.Description, e.PaidDate, -e.AmountCents, e.PropertyId)))
             .OrderBy(r => r.Date).ThenBy(r => r.Property).ToList();
-        return new Report(rows, charges.Where(c => c.Kind == "Rent").Sum(c => c.AmountCents),
-            charges.Where(c => c.Kind == "Bill").Sum(c => c.AmountCents), expenses.Sum(e => e.AmountCents),
+        return new Report(rows, payments.Where(p => charges[p.ChargeId].Kind == "Rent").Sum(p => p.AmountCents),
+            payments.Where(p => charges[p.ChargeId].Kind == "Bill").Sum(p => p.AmountCents), expenses.Sum(e => e.AmountCents),
             expenses.GroupBy(e => e.Category, StringComparer.OrdinalIgnoreCase).ToDictionary(g => g.Key, g => g.Sum(e => e.AmountCents), StringComparer.OrdinalIgnoreCase));
     }
+
+    public static IReadOnlyList<PropertySummary> PropertySummaries(Report report) => report.Rows
+        .GroupBy(r => r.PropertyId)
+        .Select(g => new PropertySummary(g.Key, g.First().Property, g.Where(r => r.Type == "Rent received").Sum(r => r.AmountCents),
+            g.Where(r => r.Type == "Bill reimbursement").Sum(r => r.AmountCents),
+            -g.Where(r => r.Type.StartsWith("Expense: ", StringComparison.Ordinal)).Sum(r => r.AmountCents)))
+        .OrderBy(x => x.Property).ThenBy(x => x.PropertyId).ToList();
 
     public static string ReportCsv(Report report)
     {
@@ -164,30 +230,61 @@ public sealed class RentalService(IRentalStore store)
         Summary("Rent less expenses (not a tax calculation)", report.NetCents);
         foreach (var category in report.ExpensesByCategory.OrderBy(x => x.Key))
             Summary($"Expense: {category.Key}", category.Value);
+        foreach (var property in PropertySummaries(report))
+        {
+            string name = $"{property.Property} (#{property.PropertyId})";
+            void PropertyTotal(string description, long amount) =>
+                result.AppendJoin(",", Escape(name), Escape("Property summary"), Escape(description), "", Amount(amount)).Append("\r\n");
+            PropertyTotal("Rent received", property.RentCents);
+            PropertyTotal("Bill reimbursements", property.ReimbursementsCents);
+            PropertyTotal("Expenses", property.ExpenseCents);
+            PropertyTotal("Rent less expenses", property.RentCents - property.ExpenseCents);
+        }
         foreach (var r in report.Rows)
             result.AppendJoin(",", Escape(r.Property), Escape(r.Type), Escape(r.Description),
                 r.Date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), Amount(r.AmountCents)).Append("\r\n");
         return result.ToString();
     }
 
-    public async Task SendNoticeAsync(int chargeId, string type, IEmailSender sender, DateOnly today)
+    public EmailDraft PrepareNotice(int chargeId, string type, DateOnly today)
     {
         var charge = Store.Charges().SingleOrDefault(c => c.Id == chargeId) ?? throw new ArgumentException("Charge not found.");
         if (type == "Bill" && (charge.Kind != "Bill" || charge.PaidDate is not null)) throw new ArgumentException("Bill notices require an unpaid bill charge.");
         if (type == "Late" && (charge.PaidDate is not null || charge.DueDate >= today)) throw new ArgumentException("Late notices require an overdue unpaid charge.");
-        if (type == "Receipt" && charge.PaidDate is null) throw new ArgumentException("A receipt requires a paid charge.");
+        var payments = Store.Payments().Where(p => p.ChargeId == chargeId).OrderByDescending(p => p.Id).ToList();
+        if (type == "Receipt" && payments.Count == 0) throw new ArgumentException("A receipt requires a recorded payment.");
         if (type is not ("Bill" or "Late" or "Receipt")) throw new ArgumentException("Unknown notice type.");
         var lease = Store.Leases().Single(l => l.Id == charge.LeaseId);
         var renter = Store.Renters().Single(r => r.Id == lease.RenterId);
         var property = Store.Properties().Single(p => p.Id == charge.PropertyId);
-        var amount = (charge.AmountCents / 100m).ToString("C", CultureInfo.CurrentCulture);
+        var amount = ((type == "Receipt" ? payments[0].AmountCents : Balance(charge)) / 100m).ToString("C", CultureInfo.CurrentCulture);
         string subject = type switch { "Bill" => "Your property bill", "Late" => "Payment overdue", _ => "Payment receipt" };
         string message = type switch
         {
             "Bill" => $"Hello {renter.Name},\n\nYour share of {charge.Description} for {property.Name} is {amount}, due {charge.DueDate:d}.",
             "Late" => $"Hello {renter.Name},\n\nYour payment of {amount} for {charge.Description} at {property.Name} was due {charge.DueDate:d} and is overdue.",
-            _ => $"Hello {renter.Name},\n\nWe received your payment of {amount} for {charge.Description} at {property.Name} on {charge.PaidDate:d}. Thank you."
+            _ => $"Hello {renter.Name},\n\nWe received your payment of {amount} for {charge.Description} at {property.Name} on {payments[0].Date:d}. Thank you."
         };
-        await sender.SendAsync(renter.Email, subject, message);
+        return new EmailDraft(chargeId, type, renter.Email, subject, message);
     }
+
+    public async Task SendPreparedAsync(EmailDraft draft, IEmailSender sender, DateOnly today)
+    {
+        var current = PrepareNotice(draft.ChargeId, draft.Type, today);
+        Required(draft.Subject, "Email subject"); Required(draft.Message, "Email message");
+        if (draft.Recipient != current.Recipient) throw new ArgumentException("The renter's email changed; prepare the message again.");
+        int id = Store.StartEmailAttempt(draft);
+        try { await sender.SendAsync(draft.Recipient, draft.Subject, draft.Message); }
+        catch (Exception ex)
+        {
+            try { Store.FinishEmailAttempt(id, "Not confirmed", ex.Message); }
+            catch (Exception logError) { throw new AggregateException("Sending failed and the attempt could not be updated.", ex, logError); }
+            throw;
+        }
+        try { Store.FinishEmailAttempt(id, "Accepted", ""); }
+        catch (Exception ex) { throw new InvalidOperationException("SendGrid accepted the message, but the history could not be updated. Check before resending.", ex); }
+    }
+
+    public Task SendNoticeAsync(int chargeId, string type, IEmailSender sender, DateOnly today) =>
+        SendPreparedAsync(PrepareNotice(chargeId, type, today), sender, today);
 }
